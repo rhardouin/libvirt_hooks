@@ -1,0 +1,112 @@
+#!/usr/bin/env python
+#
+# Libvirt hook for qemu.
+#
+# This hook catches all qemu instances creation and apply the bandwidth
+# limitation as described in the libvirt XML configuration.
+#
+import logging
+from logging.handlers import SysLogHandler
+import subprocess
+import sys
+import xml.etree.ElementTree as etree
+
+LOG = logging.getLogger(__file__)
+LOG.setLevel(logging.INFO)
+handler = SysLogHandler()
+fmt = logging.Formatter('livbirt-hook: %(levelname)s: %(message)s')
+handler.setFormatter(fmt)
+LOG.addHandler(handler)
+
+
+def call(args):
+    LOG.debug("About to execute %s " % ' '.join(args))
+    subprocess.check_call(args)
+
+
+def main():
+    LOG.debug("Arguments: %s", sys.argv)
+
+    if len(sys.argv) < 3:
+        LOG.debug("Nothing to do: too few arguments")
+        sys.exit()
+
+    guest_name = sys.argv[1]
+    action = sys.argv[2]
+
+    if action != 'started':
+        LOG.debug("Nothing to do: only started is hooked")
+        sys.exit()
+
+    xml = sys.stdin.read()
+    root = etree.fromstring(xml)
+    if_nodes = root.findall(".//interface[@type='ethernet']")
+
+    for if_node in if_nodes:
+        try:
+            dev_node = if_node.find('./target')
+            tap_name = dev_node.attrib['dev']
+
+            which_out = subprocess.check_output(['which', 'tc'])
+            tc_path = which_out.encode().replace('\n', '')
+
+            # check if traffic shaping is already set for this interface
+            class_show_dev = subprocess.check_output(
+                ['tc', 'class', 'show', 'dev', tap_name])
+
+            if class_show_dev:
+                LOG.debug("traffic on tap %s is already shaped", tap_name)
+                # try other interfaces if any
+                continue
+
+            inbound_node = if_node.find('./bandwidth/inbound')
+
+            if inbound_node is not None:
+                in_avg = '%skbps' % inbound_node.attrib['average']
+                in_peak = '%skbps' % inbound_node.attrib['peak']
+                in_burst = '%sk' % inbound_node.attrib['burst']
+
+                # egress (ingress from the VM side)
+                call([tc_path, 'qdisc', 'add', 'dev', tap_name, 'root', 'handle',
+                            '1:', 'htb', 'default', '2'])
+
+                call([tc_path, 'class', 'add', 'dev', tap_name, 'parent', '1:',
+                            'classid', '1:1', 'htb', 'rate', in_avg, 'ceil', in_peak])
+
+                call([tc_path, 'class', 'add', 'dev', tap_name, 'parent', '1:1',
+                            'classid', '1:2', 'htb', 'rate', in_avg, 'ceil', in_peak,
+                            'burst', in_burst])
+
+                call([tc_path, 'qdisc', 'add', 'dev', tap_name, 'parent', '1:2',
+                            'handle', '2:', 'sfq', 'perturb', '10'])
+
+                call([tc_path, 'filter', 'add', 'dev', tap_name, 'parent', '1:0',
+                            'protocol', 'all', 'handle', '1', 'fw', 'flowid', '1'])
+                LOG.info("tc inbound rules applied: tap=%s guest=%s", tap_name, guest_name)
+
+            outbound_node = if_node.find('./bandwidth/outbound')
+
+            if outbound_node is not None:
+                out_avg = '%skbps' % outbound_node.attrib['average']
+                out_burst = '%sk' % outbound_node.attrib['burst']
+
+                # ingress (egress from the VM side)
+                call([tc_path, 'qdisc', 'add', 'dev', tap_name, 'ingress'])
+
+                call([tc_path, 'filter', 'add', 'dev', tap_name, 'parent',
+                            'ffff:', 'protocol', 'all', 'u32', 'match', 'u32', '0',
+                            '0', 'police', 'rate', out_avg, 'burst', out_burst,
+                            'mtu', '64kb', 'drop', 'flowid', ':1'])
+                LOG.info("tc outbound rules applied: tap=%s guest=%s", tap_name, guest_name)
+
+            if inbound_node is None and outbound_node is None:
+                LOG.warning("No bandwidth limitations found in XML: tap=%s guest=%s", tap_name, guest_name)
+        except subprocess.CalledProcessError as e:
+            LOG.exception("Unable to apply bandwidth limitation: tap=%s guest=%s", tap_name, guest_name)
+            LOG.error("Output: %s", e.output)
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception:
+        LOG.exception("Unexpected exception occured")

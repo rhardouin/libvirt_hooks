@@ -8,7 +8,7 @@ Hooks for libvirt
 Libvirt does not apply traffic shaping on generic ethernet interface for now (it works well for OVS bridges).
 For instance, you need to use generic ethernet when using OpenStack and OpenContrail together.
 
-Until there is a fix in libvirt you may want to this hook as a workaround.
+Until there is a fix in libvirt you may want to install this hook as a workaround.
 
 ## Installation
 
@@ -40,7 +40,7 @@ Or depending on the platform:
 
 ## How it works
 
-Whenever an instance is started the hook call tc to apply traffic shaping if necessary.
+Whenever an instance is *started* (more on this later) the hook call tc to apply traffic shaping on each network interface if necessary.
 By necessary I mean if QoS is set on interfaces in the XML instance like so:
 
 ```xml
@@ -55,6 +55,11 @@ By necessary I mean if QoS is set on interfaces in the XML instance like so:
       ...
 </interface>
 ```
+
+### When the hooks is called?
+
+The hook is called when a qemu instance is started. So when you run a migration, live-migration, or even a **reboot**, the hook will be called.
+
 
 ## Logging
 
@@ -76,19 +81,17 @@ To any valid Python logging level: DEBUG, INFO, WARNING, ERROR Note that the hoo
 
    * the hook is called: command line arguments are logged
    * a tc command is about to be called
-
+   * the traffic shaping is already applied to a interface
 
 **INFO** log records are emitted when:
 
    * an outbound tc rule is applied
    * an inbound tc rule is applied
 
-
 **WARNING** log records are emitted when:
 
    * no bandwidth limitations are found (neither outbound nor inbound). If you use OpenStack this could happens if a Nova flavor has no quota:vif_* extra specs.
      (This is a warning since all production flavors are supposed to be bandwidth limited.)
-
 
 **ERROR** log records are emitted when:
 
@@ -102,3 +105,7 @@ To any valid Python logging level: DEBUG, INFO, WARNING, ERROR Note that the hoo
     [...] livbirt-hook:: INFO: tc inbound rules applied: tap=tap74d75d40-4a guest=instance-00015632
 
     [...] livbirt-hook:: DEBUG: About to execute /sbin/tc qdisc add dev tapf09c54b0-50 ingress
+
+## Error handling
+
+All exceptions are catched in order to be reliable and not stop the guest creation.
